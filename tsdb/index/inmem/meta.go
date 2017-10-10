@@ -286,7 +286,10 @@ func (m *Measurement) Rebuild() *Measurement {
 	// expunged.  Note: we're using SeriesIDs which returns the series in sorted order so that
 	// re-adding does not incur a sort for each series added.
 	for _, id := range m.SeriesIDs() {
-		nm.AddSeries(m.SeriesByID(id))
+		s := m.SeriesByID(id)
+		if s != nil {
+			nm.AddSeries(s)
+		}
 	}
 	return nm
 }
