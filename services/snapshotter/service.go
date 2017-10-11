@@ -15,7 +15,6 @@ import (
 	"github.com/influxdata/influxdb"
 	"github.com/influxdata/influxdb/services/meta"
 	"github.com/influxdata/influxdb/tsdb"
-	"github.com/uber-go/zap"
 )
 
 const (
@@ -26,6 +25,13 @@ const (
 	// a metastore backup file
 	BackupMagicHeader = 0x59590101
 )
+
+type Diagnostic interface {
+	Starting()
+	Closed()
+	AcceptError(err error)
+	Error(err error)
+}
 
 // Service manages the listener for the snapshot endpoint.
 type Service struct {
@@ -41,21 +47,22 @@ type Service struct {
 
 	TSDBStore *tsdb.Store
 
-	Listener net.Listener
-	Logger   zap.Logger
+	Listener   net.Listener
+	Diagnostic Diagnostic
 }
 
 // NewService returns a new instance of Service.
 func NewService() *Service {
 	return &Service{
-		err:    make(chan error),
-		Logger: zap.New(zap.NullEncoder()),
+		err: make(chan error),
 	}
 }
 
 // Open starts the service.
 func (s *Service) Open() error {
-	s.Logger.Info("Starting snapshot service")
+	if s.Diagnostic != nil {
+		s.Diagnostic.Starting()
+	}
 
 	s.wg.Add(1)
 	go s.serve()
@@ -72,8 +79,8 @@ func (s *Service) Close() error {
 }
 
 // WithLogger sets the logger on the service.
-func (s *Service) WithLogger(log zap.Logger) {
-	s.Logger = log.With(zap.String("service", "snapshot"))
+func (s *Service) With(d Diagnostic) {
+	s.Diagnostic = d
 }
 
 // Err returns a channel for fatal out-of-band errors.
@@ -87,10 +94,14 @@ func (s *Service) serve() {
 		// Wait for next connection.
 		conn, err := s.Listener.Accept()
 		if err != nil && strings.Contains(err.Error(), "connection closed") {
-			s.Logger.Info("snapshot listener closed")
+			if s.Diagnostic != nil {
+				s.Diagnostic.Closed()
+			}
 			return
 		} else if err != nil {
-			s.Logger.Info(fmt.Sprint("error accepting snapshot request: ", err.Error()))
+			if s.Diagnostic != nil {
+				s.Diagnostic.AcceptError(err)
+			}
 			continue
 		}
 
@@ -99,8 +110,8 @@ func (s *Service) serve() {
 		go func(conn net.Conn) {
 			defer s.wg.Done()
 			defer conn.Close()
-			if err := s.handleConn(conn); err != nil {
-				s.Logger.Info(err.Error())
+			if err := s.handleConn(conn); err != nil && s.Diagnostic != nil {
+				s.Diagnostic.Error(err)
 			}
 		}(conn)
 	}

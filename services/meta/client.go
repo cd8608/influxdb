@@ -7,7 +7,6 @@ import (
 	crand "crypto/rand"
 	"crypto/sha256"
 	"errors"
-	"fmt"
 	"io"
 	"io/ioutil"
 	"math/rand"
@@ -20,7 +19,6 @@ import (
 
 	"github.com/influxdata/influxdb"
 	"github.com/influxdata/influxdb/influxql"
-	"github.com/uber-go/zap"
 
 	"golang.org/x/crypto/bcrypt"
 )
@@ -44,10 +42,16 @@ var (
 	ErrService = errors.New("meta service error")
 )
 
+type Diagnostic interface {
+	ShardGroupExists(group uint64, db, rp string)
+	PrecreateShardError(group uint64, err error)
+	NewShardGroup(group uint64, db, rp string)
+}
+
 // Client is used to execute commands on and read data from
 // a meta service cluster.
 type Client struct {
-	logger zap.Logger
+	diag Diagnostic
 
 	mu        sync.RWMutex
 	closing   chan struct{}
@@ -77,7 +81,6 @@ func NewClient(config *Config) *Client {
 		},
 		closing:             make(chan struct{}),
 		changed:             make(chan struct{}),
-		logger:              zap.New(zap.NullEncoder()),
 		authCache:           make(map[string]authUser, 0),
 		path:                config.Dir,
 		retentionAutoCreate: config.RetentionAutoCreate,
@@ -794,16 +797,22 @@ func (c *Client) PrecreateShardGroups(from, to time.Time) error {
 				nextShardGroupTime := g.EndTime.Add(1 * time.Nanosecond)
 				// if it already exists, continue
 				if sg, _ := data.ShardGroupByTimestamp(di.Name, rp.Name, nextShardGroupTime); sg != nil {
-					c.logger.Info(fmt.Sprintf("shard group %d exists for database %s, retention policy %s", sg.ID, di.Name, rp.Name))
+					if c.diag != nil {
+						c.diag.ShardGroupExists(sg.ID, di.Name, rp.Name)
+					}
 					continue
 				}
 				newGroup, err := createShardGroup(data, di.Name, rp.Name, nextShardGroupTime)
 				if err != nil {
-					c.logger.Info(fmt.Sprintf("failed to precreate successive shard group for group %d: %s", g.ID, err.Error()))
+					if c.diag != nil {
+						c.diag.PrecreateShardError(g.ID, err)
+					}
 					continue
 				}
 				changed = true
-				c.logger.Info(fmt.Sprintf("new shard group %d successfully precreated for database %s, retention policy %s", newGroup.ID, di.Name, rp.Name))
+				if c.diag != nil {
+					c.diag.NewShardGroup(newGroup.ID, di.Name, rp.Name)
+				}
 			}
 		}
 	}
@@ -979,10 +988,10 @@ func (c *Client) MarshalBinary() ([]byte, error) {
 }
 
 // WithLogger sets the logger for the client.
-func (c *Client) WithLogger(log zap.Logger) {
+func (c *Client) With(d Diagnostic) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.logger = log.With(zap.String("service", "metaclient"))
+	c.diag = d
 }
 
 // snapshot saves the current meta data to disk.

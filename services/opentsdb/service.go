@@ -19,7 +19,6 @@ import (
 	"github.com/influxdata/influxdb/models"
 	"github.com/influxdata/influxdb/services/meta"
 	"github.com/influxdata/influxdb/tsdb"
-	"github.com/uber-go/zap"
 )
 
 // statistics gathered by the openTSDB package.
@@ -41,6 +40,26 @@ const (
 	statConnectionsHandled       = "connsHandled"
 	statDroppedPointsInvalid     = "droppedPointsInvalid"
 )
+
+type Diagnostic interface {
+	// Service diagnostics.
+	Starting()
+	Listening(tls bool, addr net.Addr)
+	Closed(err error)
+
+	ConnReadError(err error)
+	InternalStorageCreateError(database string, err error)
+	PointWriterError(database string, err error)
+
+	MalformedLine(line string, addr net.Addr)
+	MalformedTime(time string, addr net.Addr, err error)
+	MalformedTag(tag string, addr net.Addr)
+	MalformedFloat(valueStr string, addr net.Addr)
+
+	// Handler diagnostics.
+	DroppingPoint(metric string, err error)
+	WriteError(err error)
+}
 
 // Service manages the listener and handler for an HTTP endpoint.
 type Service struct {
@@ -73,7 +92,7 @@ type Service struct {
 	batcher      *tsdb.PointBatcher
 
 	LogPointErrors bool
-	Logger         zap.Logger
+	Diagnostic     Diagnostic
 
 	stats       *Statistics
 	defaultTags models.StatisticTags
@@ -93,7 +112,6 @@ func NewService(c Config) (*Service, error) {
 		batchSize:       d.BatchSize,
 		batchPending:    d.BatchPending,
 		batchTimeout:    time.Duration(d.BatchTimeout),
-		Logger:          zap.New(zap.NullEncoder()),
 		LogPointErrors:  d.LogPointErrors,
 		stats:           &Statistics{},
 		defaultTags:     models.StatisticTags{"bind": d.BindAddress},
@@ -111,7 +129,9 @@ func (s *Service) Open() error {
 	}
 	s.done = make(chan struct{})
 
-	s.Logger.Info("Starting OpenTSDB service")
+	if s.Diagnostic != nil {
+		s.Diagnostic.Starting()
+	}
 
 	s.batcher = tsdb.NewPointBatcher(s.batchSize, s.batchPending, s.batchTimeout)
 	s.batcher.Start()
@@ -134,7 +154,9 @@ func (s *Service) Open() error {
 			return err
 		}
 
-		s.Logger.Info(fmt.Sprint("Listening on TLS: ", listener.Addr().String()))
+		if s.Diagnostic != nil {
+			s.Diagnostic.Listening(true, listener.Addr())
+		}
 		s.ln = listener
 	} else {
 		listener, err := net.Listen("tcp", s.BindAddress)
@@ -142,7 +164,9 @@ func (s *Service) Open() error {
 			return err
 		}
 
-		s.Logger.Info(fmt.Sprint("Listening on: ", listener.Addr().String()))
+		if s.Diagnostic != nil {
+			s.Diagnostic.Listening(false, listener.Addr())
+		}
 		s.ln = listener
 	}
 	s.httpln = newChanListener(s.ln.Addr())
@@ -236,8 +260,8 @@ func (s *Service) createInternalStorage() error {
 }
 
 // WithLogger sets the logger for the service.
-func (s *Service) WithLogger(log zap.Logger) {
-	s.Logger = log.With(zap.String("service", "opentsdb"))
+func (s *Service) With(d Diagnostic) {
+	s.Diagnostic = d
 }
 
 // Statistics maintains statistics for the subscriber service.
@@ -300,10 +324,14 @@ func (s *Service) serve() {
 		// Wait for next connection.
 		conn, err := s.ln.Accept()
 		if opErr, ok := err.(*net.OpError); ok && !opErr.Temporary() {
-			s.Logger.Info("openTSDB TCP listener closed")
+			if s.Diagnostic != nil {
+				s.Diagnostic.Closed(nil)
+			}
 			return
 		} else if err != nil {
-			s.Logger.Info(fmt.Sprint("error accepting openTSDB: ", err.Error()))
+			if s.Diagnostic != nil {
+				s.Diagnostic.Closed(err)
+			}
 			continue
 		}
 
@@ -351,9 +379,6 @@ func (s *Service) handleTelnetConn(conn net.Conn) {
 	atomic.AddInt64(&s.stats.ActiveTelnetConnections, 1)
 	atomic.AddInt64(&s.stats.HandledTelnetConnections, 1)
 
-	// Get connection details.
-	remoteAddr := conn.RemoteAddr().String()
-
 	// Wrap connection in a text protocol reader.
 	r := textproto.NewReader(bufio.NewReader(conn))
 	for {
@@ -361,7 +386,9 @@ func (s *Service) handleTelnetConn(conn net.Conn) {
 		if err != nil {
 			if err != io.EOF {
 				atomic.AddInt64(&s.stats.TelnetReadError, 1)
-				s.Logger.Info(fmt.Sprint("error reading from openTSDB connection ", err.Error()))
+				if s.Diagnostic != nil {
+					s.Diagnostic.ConnReadError(err)
+				}
 			}
 			return
 		}
@@ -377,8 +404,8 @@ func (s *Service) handleTelnetConn(conn net.Conn) {
 
 		if len(inputStrs) < 4 || inputStrs[0] != "put" {
 			atomic.AddInt64(&s.stats.TelnetBadLine, 1)
-			if s.LogPointErrors {
-				s.Logger.Info(fmt.Sprintf("malformed line '%s' from %s", line, remoteAddr))
+			if s.LogPointErrors && s.Diagnostic != nil {
+				s.Diagnostic.MalformedLine(line, conn.RemoteAddr())
 			}
 			continue
 		}
@@ -392,8 +419,8 @@ func (s *Service) handleTelnetConn(conn net.Conn) {
 		ts, err := strconv.ParseInt(tsStr, 10, 64)
 		if err != nil {
 			atomic.AddInt64(&s.stats.TelnetBadTime, 1)
-			if s.LogPointErrors {
-				s.Logger.Info(fmt.Sprintf("malformed time '%s' from %s", tsStr, remoteAddr))
+			if s.LogPointErrors && s.Diagnostic != nil {
+				s.Diagnostic.MalformedTime(tsStr, conn.RemoteAddr(), err)
 			}
 		}
 
@@ -404,8 +431,8 @@ func (s *Service) handleTelnetConn(conn net.Conn) {
 			t = time.Unix(ts/1000, (ts%1000)*1000)
 		default:
 			atomic.AddInt64(&s.stats.TelnetBadTime, 1)
-			if s.LogPointErrors {
-				s.Logger.Info(fmt.Sprintf("bad time '%s' must be 10 or 13 chars, from %s ", tsStr, remoteAddr))
+			if s.LogPointErrors && s.Diagnostic != nil {
+				s.Diagnostic.MalformedTime(tsStr, conn.RemoteAddr(), fmt.Errorf("must be 10 or 13 chars"))
 			}
 			continue
 		}
@@ -415,8 +442,8 @@ func (s *Service) handleTelnetConn(conn net.Conn) {
 			parts := strings.SplitN(tagStrs[t], "=", 2)
 			if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
 				atomic.AddInt64(&s.stats.TelnetBadTag, 1)
-				if s.LogPointErrors {
-					s.Logger.Info(fmt.Sprintf("malformed tag data '%v' from %s", tagStrs[t], remoteAddr))
+				if s.LogPointErrors && s.Diagnostic != nil {
+					s.Diagnostic.MalformedTag(tagStrs[t], conn.RemoteAddr())
 				}
 				continue
 			}
@@ -429,8 +456,8 @@ func (s *Service) handleTelnetConn(conn net.Conn) {
 		fv, err := strconv.ParseFloat(valueStr, 64)
 		if err != nil {
 			atomic.AddInt64(&s.stats.TelnetBadFloat, 1)
-			if s.LogPointErrors {
-				s.Logger.Info(fmt.Sprintf("bad float '%s' from %s", valueStr, remoteAddr))
+			if s.LogPointErrors && s.Diagnostic != nil {
+				s.Diagnostic.MalformedFloat(valueStr, conn.RemoteAddr())
 			}
 			continue
 		}
@@ -439,8 +466,8 @@ func (s *Service) handleTelnetConn(conn net.Conn) {
 		pt, err := models.NewPoint(measurement, models.NewTags(tags), fields, t)
 		if err != nil {
 			atomic.AddInt64(&s.stats.TelnetBadFloat, 1)
-			if s.LogPointErrors {
-				s.Logger.Info(fmt.Sprintf("bad float '%s' from %s", valueStr, remoteAddr))
+			if s.LogPointErrors && s.Diagnostic != nil {
+				s.Diagnostic.MalformedFloat(valueStr, conn.RemoteAddr())
 			}
 			continue
 		}
@@ -454,7 +481,7 @@ func (s *Service) serveHTTP() {
 		Database:        s.Database,
 		RetentionPolicy: s.RetentionPolicy,
 		PointsWriter:    s.PointsWriter,
-		Logger:          s.Logger,
+		Diagnostic:      s.Diagnostic,
 		stats:           s.stats,
 	}
 	srv := &http.Server{Handler: handler}
@@ -470,7 +497,9 @@ func (s *Service) processBatches(batcher *tsdb.PointBatcher) {
 		case batch := <-batcher.Out():
 			// Will attempt to create database if not yet created.
 			if err := s.createInternalStorage(); err != nil {
-				s.Logger.Info(fmt.Sprintf("Required database %s does not yet exist: %s", s.Database, err.Error()))
+				if s.Diagnostic != nil {
+					s.Diagnostic.InternalStorageCreateError(s.Database, err)
+				}
 				continue
 			}
 
@@ -478,7 +507,9 @@ func (s *Service) processBatches(batcher *tsdb.PointBatcher) {
 				atomic.AddInt64(&s.stats.BatchesTransmitted, 1)
 				atomic.AddInt64(&s.stats.PointsTransmitted, int64(len(batch)))
 			} else {
-				s.Logger.Info(fmt.Sprintf("failed to write point batch to database %q: %s", s.Database, err))
+				if s.Diagnostic != nil {
+					s.Diagnostic.PointWriterError(s.Database, err)
+				}
 				atomic.AddInt64(&s.stats.BatchesTransmitFail, 1)
 			}
 		}

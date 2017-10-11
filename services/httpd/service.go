@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/influxdata/influxdb/models"
-	"github.com/uber-go/zap"
+	"github.com/influxdata/influxdb/services/meta"
 )
 
 // statistics gathered by the httpd package.
@@ -44,6 +44,24 @@ const (
 	statPromReadRequest  = "promReadReq"  // Number of read requests to the prometheus endpoint
 )
 
+type Diagnostic interface {
+	// Service diagnostics.
+	Starting(authEnabled bool)
+	Listening(protocol string, addr net.Addr)
+
+	// Handler diagnostics.
+	UnauthorizedRequest(user meta.User, query, database string)
+	AsyncQueryError(query string, err error)
+	WriteBodyReceived(body []byte)
+	WriteBodyReadError()
+	StatusDeprecated()
+	PromWriteBodyReceived(body []byte)
+	PromWriteBodyReadError()
+	PromWriteError(err error)
+	JWTClaimsAssertError()
+	HttpError(status int, errStr string)
+}
+
 // Service manages the listener and handler for an HTTP endpoint.
 type Service struct {
 	ln    net.Listener
@@ -60,7 +78,10 @@ type Service struct {
 
 	Handler *Handler
 
-	Logger zap.Logger
+	Diagnostic interface {
+		Starting(authEnabled bool)
+		Listening(protocol string, addr net.Addr)
+	}
 }
 
 // NewService returns a new instance of Service.
@@ -75,19 +96,18 @@ func NewService(c Config) *Service {
 		unixSocket: c.UnixSocketEnabled,
 		bindSocket: c.BindSocket,
 		Handler:    NewHandler(c),
-		Logger:     zap.New(zap.NullEncoder()),
 	}
 	if s.key == "" {
 		s.key = s.cert
 	}
-	s.Handler.Logger = s.Logger
 	return s
 }
 
 // Open starts the service.
 func (s *Service) Open() error {
-	s.Logger.Info("Starting HTTP service")
-	s.Logger.Info(fmt.Sprint("Authentication enabled:", s.Handler.Config.AuthEnabled))
+	if s.Diagnostic != nil {
+		s.Diagnostic.Starting(s.Handler.Config.AuthEnabled)
+	}
 
 	// Open listener.
 	if s.https {
@@ -103,7 +123,9 @@ func (s *Service) Open() error {
 			return err
 		}
 
-		s.Logger.Info(fmt.Sprint("Listening on HTTPS:", listener.Addr().String()))
+		if s.Diagnostic != nil {
+			s.Diagnostic.Listening("HTTPS", listener.Addr())
+		}
 		s.ln = listener
 	} else {
 		listener, err := net.Listen("tcp", s.addr)
@@ -111,7 +133,9 @@ func (s *Service) Open() error {
 			return err
 		}
 
-		s.Logger.Info(fmt.Sprint("Listening on HTTP:", listener.Addr().String()))
+		if s.Diagnostic != nil {
+			s.Diagnostic.Listening("HTTP", listener.Addr())
+		}
 		s.ln = listener
 	}
 
@@ -132,7 +156,9 @@ func (s *Service) Open() error {
 			return err
 		}
 
-		s.Logger.Info(fmt.Sprint("Listening on unix socket:", listener.Addr().String()))
+		if s.Diagnostic != nil {
+			s.Diagnostic.Listening("unix socket", listener.Addr())
+		}
 		s.unixSocketListener = listener
 
 		go s.serveUnixSocket()
@@ -177,9 +203,9 @@ func (s *Service) Close() error {
 }
 
 // WithLogger sets the logger for the service.
-func (s *Service) WithLogger(log zap.Logger) {
-	s.Logger = log.With(zap.String("service", "httpd"))
-	s.Handler.Logger = s.Logger
+func (s *Service) With(d Diagnostic) {
+	s.Diagnostic = d
+	s.Handler.Diagnostic = d
 }
 
 // Err returns a channel for fatal errors that occur on the listener.

@@ -15,7 +15,6 @@ import (
 	"github.com/influxdata/influxdb/monitor/diagnostics"
 	"github.com/influxdata/influxdb/services/meta"
 	"github.com/influxdata/influxdb/tsdb"
-	"github.com/uber-go/zap"
 )
 
 const udpBufferSize = 65536
@@ -42,6 +41,17 @@ func (c *tcpConnection) Close() {
 	c.conn.Close()
 }
 
+type Diagnostic interface {
+	WithContext(bindAddress string) Diagnostic
+	Starting(batchSize int, batchTimeout time.Duration)
+	Listening(protocol string, addr net.Addr)
+	TCPListenerClosed()
+	TCPAcceptError(err error)
+	LineParseError(line string, err error)
+	InternalStorageCreateError(err error)
+	PointWriterError(database string, err error)
+}
+
 // Service represents a Graphite service.
 type Service struct {
 	bindAddress     string
@@ -56,7 +66,7 @@ type Service struct {
 	batcher *tsdb.PointBatcher
 	parser  *Parser
 
-	logger      zap.Logger
+	diag        Diagnostic
 	stats       *Statistics
 	defaultTags models.StatisticTags
 
@@ -103,7 +113,6 @@ func NewService(c Config) (*Service, error) {
 		batchPending:    d.BatchPending,
 		udpReadBuffer:   d.UDPReadBuffer,
 		batchTimeout:    time.Duration(d.BatchTimeout),
-		logger:          zap.New(zap.NullEncoder()),
 		stats:           &Statistics{},
 		defaultTags:     models.StatisticTags{"proto": d.Protocol, "bind": d.BindAddress},
 		tcpConnections:  make(map[string]*tcpConnection),
@@ -133,7 +142,9 @@ func (s *Service) Open() error {
 	}
 	s.done = make(chan struct{})
 
-	s.logger.Info(fmt.Sprintf("Starting graphite service, batch size %d, batch timeout %s", s.batchSize, s.batchTimeout))
+	if s.diag != nil {
+		s.diag.Starting(s.batchSize, s.batchTimeout)
+	}
 
 	// Register diagnostics if a Monitor service is available.
 	if s.Monitor != nil {
@@ -159,7 +170,9 @@ func (s *Service) Open() error {
 		return err
 	}
 
-	s.logger.Info(fmt.Sprintf("Listening on %s: %s", strings.ToUpper(s.protocol), s.addr.String()))
+	if s.diag != nil {
+		s.diag.Listening(s.protocol, s.addr)
+	}
 	return nil
 }
 func (s *Service) closeAllConnections() {
@@ -266,11 +279,8 @@ func (s *Service) createInternalStorage() error {
 }
 
 // WithLogger sets the logger on the service.
-func (s *Service) WithLogger(log zap.Logger) {
-	s.logger = log.With(
-		zap.String("service", "graphite"),
-		zap.String("addr", s.bindAddress),
-	)
+func (s *Service) With(d Diagnostic) {
+	s.diag = d.WithContext(s.bindAddress)
 }
 
 // Statistics maintains statistics for the graphite service.
@@ -324,11 +334,15 @@ func (s *Service) openTCPServer() (net.Addr, error) {
 		for {
 			conn, err := s.ln.Accept()
 			if opErr, ok := err.(*net.OpError); ok && !opErr.Temporary() {
-				s.logger.Info("graphite TCP listener closed")
+				if s.diag != nil {
+					s.diag.TCPListenerClosed()
+				}
 				return
 			}
 			if err != nil {
-				s.logger.Info("error accepting TCP connection", zap.Error(err))
+				if s.diag != nil {
+					s.diag.TCPAcceptError(err)
+				}
 				continue
 			}
 
@@ -439,7 +453,9 @@ func (s *Service) handleLine(line string) {
 				return
 			}
 		}
-		s.logger.Info(fmt.Sprintf("unable to parse line: %s: %s", line, err))
+		if s.diag != nil {
+			s.diag.LineParseError(line, err)
+		}
 		atomic.AddInt64(&s.stats.PointsParseFail, 1)
 		return
 	}
@@ -455,7 +471,9 @@ func (s *Service) processBatches(batcher *tsdb.PointBatcher) {
 		case batch := <-batcher.Out():
 			// Will attempt to create database if not yet created.
 			if err := s.createInternalStorage(); err != nil {
-				s.logger.Info(fmt.Sprintf("Required database or retention policy do not yet exist: %s", err.Error()))
+				if s.diag != nil {
+					s.diag.InternalStorageCreateError(err)
+				}
 				continue
 			}
 
@@ -463,7 +481,9 @@ func (s *Service) processBatches(batcher *tsdb.PointBatcher) {
 				atomic.AddInt64(&s.stats.BatchesTransmitted, 1)
 				atomic.AddInt64(&s.stats.PointsTransmitted, int64(len(batch)))
 			} else {
-				s.logger.Info(fmt.Sprintf("failed to write point batch to database %q: %s", s.database, err))
+				if s.diag != nil {
+					s.diag.PointWriterError(s.database, err)
+				}
 				atomic.AddInt64(&s.stats.BatchesTransmitFail, 1)
 			}
 

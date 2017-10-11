@@ -2,19 +2,22 @@
 package precreator // import "github.com/influxdata/influxdb/services/precreator"
 
 import (
-	"fmt"
 	"sync"
 	"time"
-
-	"github.com/uber-go/zap"
 )
+
+type Diagnostic interface {
+	Starting(checkInterval, advancedPeriod time.Duration)
+	Closing()
+	PrecreateError(err error)
+}
 
 // Service manages the shard precreation service.
 type Service struct {
 	checkInterval time.Duration
 	advancePeriod time.Duration
 
-	Logger zap.Logger
+	Diagnostic Diagnostic
 
 	done chan struct{}
 	wg   sync.WaitGroup
@@ -29,15 +32,14 @@ func NewService(c Config) (*Service, error) {
 	s := Service{
 		checkInterval: time.Duration(c.CheckInterval),
 		advancePeriod: time.Duration(c.AdvancePeriod),
-		Logger:        zap.New(zap.NullEncoder()),
 	}
 
 	return &s, nil
 }
 
 // WithLogger sets the logger for the service.
-func (s *Service) WithLogger(log zap.Logger) {
-	s.Logger = log.With(zap.String("service", "shard-precreation"))
+func (s *Service) With(d Diagnostic) {
+	s.Diagnostic = d
 }
 
 // Open starts the precreation service.
@@ -46,8 +48,9 @@ func (s *Service) Open() error {
 		return nil
 	}
 
-	s.Logger.Info(fmt.Sprintf("Starting precreation service with check interval of %s, advance period of %s",
-		s.checkInterval, s.advancePeriod))
+	if s.Diagnostic != nil {
+		s.Diagnostic.Starting(s.checkInterval, s.advancePeriod)
+	}
 
 	s.done = make(chan struct{})
 
@@ -77,10 +80,14 @@ func (s *Service) runPrecreation() {
 		select {
 		case <-time.After(s.checkInterval):
 			if err := s.precreate(time.Now().UTC()); err != nil {
-				s.Logger.Info(fmt.Sprintf("failed to precreate shards: %s", err.Error()))
+				if s.Diagnostic != nil {
+					s.Diagnostic.PrecreateError(err)
+				}
 			}
 		case <-s.done:
-			s.Logger.Info("Precreation service terminating")
+			if s.Diagnostic != nil {
+				s.Diagnostic.Closing()
+			}
 			return
 		}
 	}
